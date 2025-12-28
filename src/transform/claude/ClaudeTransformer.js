@@ -11,6 +11,7 @@
 // 所以需要代理进程内维护一份 tool_use.id -> thoughtSignature 的映射，并在转回 v1internal 时补回。
 const toolThoughtSignatures = new Map(); // tool_use.id -> thoughtSignature
 const crypto = require("crypto");
+const { maybeInjectMcpHintIntoSystemText } = require("../../mcp/claudeTransformerMcp");
 
 function makeToolUseId() {
   // Claude Code expects tool_use ids to look like official "toolu_*" ids.
@@ -77,6 +78,7 @@ class StreamingState {
     this.blockIndex = 0;
     this.messageStartSent = false;
     this.messageStopSent = false;
+    this.overrideModel = null;
     this.usedTool = false;
     this.hasThinking = false;
     this.signatures = new SignatureManager();  // thinking/FC 签名
@@ -113,7 +115,7 @@ class StreamingState {
         type: "message",
         role: "assistant",
         content: [],
-        model: rawJSON.modelVersion,
+        model: this.overrideModel || rawJSON.modelVersion,
         stop_reason: null,
         stop_sequence: null,
         ...(usage ? { usage } : {})
@@ -769,33 +771,54 @@ function mapClaudeModelToGemini(claudeModel) {
  * 转换 Claude 请求为 v1internal 请求 body（不包含 URL/Authorization）。
  * @param {Object} claudeReq - Claude 格式的请求
  * @param {string} projectId - 项目 ID
+ * @param {Object} [options]
+ * @param {boolean} [options.forwardThoughtSignatures=true] - 是否转发 thoughtSignature / thought=true
+ * @param {number} [options.signatureSegmentStartIndex] - 只转发 messages[>=start] 内的签名（用于跨模型段隔离）
  * @returns {{ body: object }} 包含 v1internal body 的对象
  */
-function transformClaudeRequestIn(claudeReq, projectId) {
+function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
   // 需要 crypto 模块生成 requestId
   const crypto = require("crypto");
   
-  const hasWebSearchTool =
-    Array.isArray(claudeReq.tools) &&
-    claudeReq.tools.some((tool) => tool?.name === "web_search");
+	  const hasWebSearchTool =
+	    Array.isArray(claudeReq.tools) &&
+	    claudeReq.tools.some((tool) => tool?.name === "web_search");
 
-  const isClaudeModel = String(mapClaudeModelToGemini(claudeReq.model)).startsWith("claude");
+	  const isClaudeModel = String(mapClaudeModelToGemini(claudeReq.model)).startsWith("claude");
+
+  // thoughtSignature（Thought Signatures 协议）：
+  // - 同模型链路（Claude↔Claude / Gemini↔Gemini）必须原样转发，否则会出现签名缺失/不匹配导致 400。
+  // - 跨模型切换时应在路由层按“段”清洗（避免把上一段模型签名带到另一段上游）。
+  const forwardThoughtSignaturesByDefault = options?.forwardThoughtSignatures !== false;
+  const signatureSegmentStartIndex = Number.isInteger(options?.signatureSegmentStartIndex)
+    ? options.signatureSegmentStartIndex
+    : null;
 
   // 记录 tool_use id 到 name 的映射，便于后续 tool_result 还原函数名
   const toolIdToName = new Map();
 
   // 1. System Instruction
   let systemInstruction = undefined;
-  if (claudeReq.system) {
-    const systemParts = [];
-    if (Array.isArray(claudeReq.system)) {
-      for (const item of claudeReq.system) {
-        if (item && item.type === "text") {
-          systemParts.push({ text: item.text || "" });
-        }
-      }
-    } else if (typeof claudeReq.system === "string") {
-      systemParts.push({ text: claudeReq.system });
+	  if (claudeReq.system) {
+	    const systemParts = [];
+	    let injectedMcpHintIntoSystem = false;
+	    if (Array.isArray(claudeReq.system)) {
+	      for (const item of claudeReq.system) {
+	        if (item && item.type === "text") {
+	          let text = item.text || "";
+	          const injectedResult = maybeInjectMcpHintIntoSystemText({
+	            text,
+	            claudeReq,
+	            isClaudeModel,
+	            injected: injectedMcpHintIntoSystem,
+	          });
+	          text = injectedResult.text;
+	          injectedMcpHintIntoSystem = injectedResult.injected;
+	          systemParts.push({ text });
+	        }
+	      }
+	    } else if (typeof claudeReq.system === "string") {
+	      systemParts.push({ text: claudeReq.system });
     }
 
     if (systemParts.length > 0) {
@@ -809,13 +832,21 @@ function transformClaudeRequestIn(claudeReq, projectId) {
   // 2. Contents (Messages)
   const contents = [];
   if (claudeReq.messages) {
-    for (const msg of claudeReq.messages) {
+    for (let msgIndex = 0; msgIndex < claudeReq.messages.length; msgIndex++) {
+      const msg = claudeReq.messages[msgIndex];
+      const shouldForwardThoughtSignatures =
+        forwardThoughtSignaturesByDefault &&
+        (signatureSegmentStartIndex == null || msgIndex >= signatureSegmentStartIndex);
       let role = msg.role;
       if (role === "assistant") {
         role = "model";
       }
 
       const clientContent = { role, parts: [] };
+      // Claude extended-thinking blocks must be leading within an assistant message. If we ever see a
+      // thinking block after any non-thinking content (text/tool/image/etc), drop it to avoid invalid
+      // thought parts (and leaking late "thinking" as plain text).
+      let sawNonThinkingContent = false;
       
       if (Array.isArray(msg.content)) {
         for (const item of msg.content) {
@@ -823,6 +854,7 @@ function transformClaudeRequestIn(claudeReq, projectId) {
             const text = typeof item.text === "string" ? item.text : "";
             if (!text || text === "(no content)") continue;
             clientContent.parts.push({ text });
+            sawNonThinkingContent = true;
           } else if (item.type === "thinking") {
             // 根据官方文档：签名必须在收到签名的那个 part 上原样返回
             // 重要：我们在 response 侧会用一个空的 Claude "thinking" block 来承载“空 text part 的 thoughtSignature”（Claude text 不支持 signature）。
@@ -832,6 +864,7 @@ function transformClaudeRequestIn(claudeReq, projectId) {
 
             if (signature && thinkingText.length === 0) {
               // 文本签名载体块：严格按官方参考行为合并回“前一个非空 text part”（绝不附着到 functionCall）。
+              if (!shouldForwardThoughtSignatures) continue;
               for (let i = clientContent.parts.length - 1; i >= 0; i--) {
                 const p = clientContent.parts[i];
                 const canCarry =
@@ -850,16 +883,25 @@ function transformClaudeRequestIn(claudeReq, projectId) {
             // 避免请求侧发送空字符串字段（部分上游会直接 400）
             if (thinkingText.length === 0) continue;
 
-            const part = { text: thinkingText, thought: true };
-            // 如果 thinking 有 signature，直接附加到当前 part
-            if (signature) {
-              part.thoughtSignature = signature;
+            // thinking blocks must be leading within the assistant message.
+            if (sawNonThinkingContent) continue;
+
+            // Claude 上游在开启 thinking 时会校验签名；如果历史里出现 thinking 但没有 signature，
+            // 继续以 thought=true 回传会直接 400（messages.*.thinking.signature: Field required）。
+            // 这种情况下只能降级为普通 text part，避免破坏整体链路（不影响已有的签名转发逻辑）。
+            if (signature && shouldForwardThoughtSignatures) {
+              clientContent.parts.push({ text: thinkingText, thought: true, thoughtSignature: signature });
+            } else {
+              clientContent.parts.push({ text: thinkingText });
+              sawNonThinkingContent = true;
             }
-            clientContent.parts.push(part);
           } else if (item.type === "redacted_thinking") {
             const text = typeof item.data === "string" ? item.data : "";
             if (!text) continue;
-            clientContent.parts.push({ text, thought: true });
+            if (sawNonThinkingContent) continue;
+            // redacted_thinking 同样可能没有签名，按普通文本降级，避免上游签名校验报错
+            clientContent.parts.push({ text });
+            sawNonThinkingContent = true;
           } else if (item.type === "image") {
             // Handle image
             const source = item.source || {};
@@ -870,6 +912,7 @@ function transformClaudeRequestIn(claudeReq, projectId) {
                   data: source.data || "",
                 },
               });
+              sawNonThinkingContent = true;
             }
           } else if (item.type === "tool_use") {
             // 根据官方文档：签名必须在收到签名的那个 functionCall part 上原样返回
@@ -886,13 +929,14 @@ function transformClaudeRequestIn(claudeReq, projectId) {
             // 如果 tool_use 有 signature（少数客户端会回传），直接使用；
             // 否则从缓存补回（Claude Code 不会回传 tool_use.signature）。
             const sig = item.signature || getToolThoughtSignature(item.id);
-            if (sig) {
+            if (sig && shouldForwardThoughtSignatures) {
               fcPart.thoughtSignature = sig;
               if (!item.signature && isDebugEnabled()) {
                 console.log(`[ThoughtSignature] injected tool_use.id=${item.id}`);
               }
             }
             clientContent.parts.push(fcPart);
+            sawNonThinkingContent = true;
           } else if (item.type === "tool_result") {
             // 优先用先前记录的 tool_use id -> name 映射，还原原始函数名
             let funcName = toolIdToName.get(item.tool_use_id) || item.tool_use_id;
@@ -909,6 +953,7 @@ function transformClaudeRequestIn(claudeReq, projectId) {
                 id: item.tool_use_id,
               },
             });
+            sawNonThinkingContent = true;
           }
         }
       } else if (typeof msg.content === "string") {
@@ -940,6 +985,7 @@ function transformClaudeRequestIn(claudeReq, projectId) {
       ];
     } else {
       tools = [{ functionDeclarations: [] }];
+
       for (const tool of claudeReq.tools) {
         // Claude 模型下：不把 mcp__ 工具暴露给上游（避免上游尝试 tool_use）
         if (
@@ -1067,22 +1113,22 @@ function transformClaudeRequestIn(claudeReq, projectId) {
 /**
  * 转换 Claude 格式响应
  */
-async function transformClaudeResponseOut(response) {
+async function transformClaudeResponseOut(response, options = {}) {
   const contentType = response.headers.get("Content-Type") || "";
   
   if (contentType.includes("application/json")) {
-    return handleNonStreamingResponse(response);
+    return handleNonStreamingResponse(response, options);
   }
   
   if (contentType.includes("stream")) {
-    return handleStreamingResponse(response);
+    return handleStreamingResponse(response, options);
   }
   
   return response;
 }
 
 // 处理非流式响应
-async function handleNonStreamingResponse(response) {
+async function handleNonStreamingResponse(response, options = {}) {
   let json = await response.json();
   json = json.response || json;
   
@@ -1098,7 +1144,8 @@ async function handleNonStreamingResponse(response) {
   const isWebSearch = hasWebSearchQueries || hasGroundingChunks || hasGroundingSupports;
 
   if (isWebSearch) {
-    const message = await buildNonStreamingWebSearchMessage(json);
+    const message = await buildNonStreamingWebSearchMessage(json, options);
+    if (options?.overrideModel) message.model = options.overrideModel;
     return new Response(JSON.stringify(message), {
       status: response.status,
       headers: { "Content-Type": "application/json" },
@@ -1107,6 +1154,7 @@ async function handleNonStreamingResponse(response) {
 
   const processor = new NonStreamingProcessor(json);
   const result = processor.process();
+  if (options?.overrideModel) result.model = options.overrideModel;
   
   return new Response(JSON.stringify(result), {
     status: response.status,
@@ -1114,7 +1162,7 @@ async function handleNonStreamingResponse(response) {
   });
 }
 
-async function buildNonStreamingWebSearchMessage(rawJSON) {
+async function buildNonStreamingWebSearchMessage(rawJSON, options = {}) {
   const candidate = rawJSON?.candidates?.[0] || {};
   const parts = candidate?.content?.parts || [];
   const groundingMetadata = candidate?.groundingMetadata || {};
@@ -1182,7 +1230,7 @@ async function buildNonStreamingWebSearchMessage(rawJSON) {
     id: rawJSON.responseId || "",
     type: "message",
     role: "assistant",
-    model: rawJSON.modelVersion || "",
+    model: options?.overrideModel || rawJSON.modelVersion || "",
     content,
     stop_reason: stopReason,
     stop_sequence: null,
@@ -1191,7 +1239,7 @@ async function buildNonStreamingWebSearchMessage(rawJSON) {
 }
 
 // 处理流式响应
-async function handleStreamingResponse(response) {
+async function handleStreamingResponse(response, options = {}) {
   if (!response.body) return response;
   
   const reader = response.body.getReader();
@@ -1201,6 +1249,7 @@ async function handleStreamingResponse(response) {
   const stream = new ReadableStream({
     async start(controller) {
       const state = new StreamingState(encoder, controller);
+      if (options?.overrideModel) state.overrideModel = options.overrideModel;
       const processor = new PartProcessor(state);
       
       try {

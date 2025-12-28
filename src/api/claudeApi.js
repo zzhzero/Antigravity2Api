@@ -1,4 +1,10 @@
 const { transformClaudeRequestIn, transformClaudeResponseOut, mapClaudeModelToGemini } = require("../transform/claude");
+const { getMcpSwitchModel } = require("../mcp/mcpSwitchFlag");
+const {
+  prepareMcpContext,
+  bufferForMcpSwitchAndMaybeRetry,
+  updateSessionAfterResponse,
+} = require("../mcp/claudeApiMcp");
 
 function hasWebSearchTool(claudeReq) {
   return Array.isArray(claudeReq?.tools) && claudeReq.tools.some((tool) => tool?.name === "web_search");
@@ -25,6 +31,7 @@ class ClaudeApi {
     this.upstream = options.upstreamClient;
     this.logger = options.logger || null;
     this.debugRequestResponse = !!options.debug;
+    this.sessionMcpState = new Map(); // sessionId -> { lastFamily, mcpStartIndex, foldedSegments: [] }
   }
 
   log(title, data) {
@@ -165,14 +172,31 @@ class ClaudeApi {
 
       const method = requestData.stream ? "streamGenerateContent" : "generateContent";
       const queryString = requestData.stream ? "?alt=sse" : "";
-      const modelForQuota = inferFinalModelForQuota(requestData);
+
+      const mcpModel = getMcpSwitchModel();
+      let baseModel = requestData.model;
+      let modelForQuota = inferFinalModelForQuota(requestData);
+      let upstreamRequestForTransform = requestData;
+      let shouldBufferForSwitch = false;
+      let transformOptions = undefined;
+      let sessionState = null;
+
+      if (mcpModel) {
+        ({ baseModel, modelForQuota, upstreamRequestForTransform, shouldBufferForSwitch, transformOptions, sessionState } =
+          prepareMcpContext({
+            requestData,
+            sessionMcpState: this.sessionMcpState,
+            mcpModel,
+            inferFinalModelForQuota,
+          }));
+      }
 
       let loggedTransformed = false;
       const response = await this.upstream.callV1Internal(method, {
         model: modelForQuota,
         queryString,
         buildBody: (projectId) => {
-          const { body: googleBody } = transformClaudeRequestIn(requestData, projectId);
+          const { body: googleBody } = transformClaudeRequestIn(upstreamRequestForTransform, projectId, transformOptions);
           if (!loggedTransformed) {
             this.logDebug("Gemini Payload Request (Transformed)", googleBody);
             loggedTransformed = true;
@@ -225,10 +249,44 @@ class ClaudeApi {
         }
       }
 
-      const convertedResponse = await transformClaudeResponseOut(responseForTransform);
+      const convertedResponse = await transformClaudeResponseOut(
+        responseForTransform,
+        mcpModel ? { overrideModel: baseModel } : undefined,
+      );
 
       let finalResponseBody = convertedResponse.body;
-      if (this.debugRequestResponse && convertedResponse.body) {
+
+      if (mcpModel) {
+        const bufferedResult = await bufferForMcpSwitchAndMaybeRetry({
+          upstream: this.upstream,
+          method,
+          queryString,
+          requestData,
+          baseModel,
+          mcpModel,
+          convertedResponse,
+          shouldBufferForSwitch,
+          debugRequestResponse: this.debugRequestResponse,
+          log: (title, data) => this.log(title, data),
+          logDebug: (title, data) => this.logDebug(title, data),
+          logStreamContent: (stream, label) => this.logStreamContent(stream, label),
+          sessionState,
+        });
+        if (bufferedResult?.apiResponse) return bufferedResult.apiResponse;
+        if (bufferedResult?.finalResponseBody) {
+          finalResponseBody = bufferedResult.finalResponseBody;
+        } else if (this.debugRequestResponse && convertedResponse.body) {
+          try {
+            const [logBranch, processBranch] = convertedResponse.body.tee();
+            this.logStreamContent(logBranch, "Claude Response Payload (Transformed Stream)");
+            finalResponseBody = processBranch;
+          } catch (e) {
+            this.log("Error teeing converted stream for logging", e.message || e);
+          }
+        }
+
+        updateSessionAfterResponse({ sessionState, requestData, baseModel, modelForQuota, mcpModel });
+      } else if (this.debugRequestResponse && convertedResponse.body) {
         try {
           const [logBranch, processBranch] = convertedResponse.body.tee();
           this.logStreamContent(logBranch, "Claude Response Payload (Transformed Stream)");

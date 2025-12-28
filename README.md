@@ -3,6 +3,7 @@
 本服务将 Antigravity 代理出来，转换为标准的 Claude API 和 Gemini API 接口，
 
 * 完整适配CC
+* WORK-AROUND for MCP
 * function_calling
 * subagent
 * 结构化输出
@@ -21,6 +22,27 @@
 
 已知问题：
 在使用MCP时，claude转为antigravity的v1internal接口所使用的gemini格式后，v1internal内部判断当前model是claude，会将request转回claude格式，但是其内部接口又不能使用claude的一些字段，所以MCP会有各种奇奇怪怪的问题，这也是使用原生Antigravity时会出现各种MCP问题的原因。只能看google后续会不会去修Antigravity的MCP，本项目暂时不想去改有关于MCP的问题。
+
+### WORK-AROUND FOR MCP 折中方案（实验性）
+
+虽然 Antigravity 内部的 MCP 兼容性问题无法从外部彻底修复，但本项目提供一个“切换到 Gemini 执行 MCP”的折中方案，避免 Claude 模型直接触发 MCP 导致异常。
+
+**原理（简述）**
+
+- Claude 段：当检测到请求里存在 `mcp__*` 工具时，会在 system 中注入强提示：**严禁直接调用 MCP 工具**，需要通过输出特殊字符串 `AG2API_SWITCH_TO_MCP_MODEL` 通知服务端切换。
+- 服务端：如果在首轮流式输出中检测到 `AG2API_SWITCH_TO_MCP_MODEL`（或仍然出现 `mcp__*` 的 `tool_use`），会丢弃这次输出并用 `AG2API_SWITCH_TO_MCP_MODEL` 指定的 `gemini-*` 模型重发本轮请求，让 Gemini 来完成 MCP 工具调用。
+- 会话隔离：进入 Gemini（MCP）段后，后续相关 `tool_result` 回合继续路由到该 Gemini 模型；回到 Claude 段时会折叠 MCP 段历史，避免跨模型携带 thought/signature 导致 `Corrupted thought signature` 等报错。
+
+**使用方法**
+
+1) 在 `.env` 配置 `AG2API_SWITCH_TO_MCP_MODEL`（为空/不配置则完全关闭该功能）：
+
+```bash
+# 推荐示例（仅示例，必须显式配置才会启用）
+AG2API_SWITCH_TO_MCP_MODEL=gemini-3-flash
+```
+
+2) 重启服务后，Claude Code/客户端正常使用 `mcp__*` 工具场景即可（触发时服务端会自动切换并重试）。
 
 > **推荐启动方式**：在项目根目录运行 `npm run start`（或 `node src/server.js`）。本项目会以当前工作目录（`process.cwd()`）定位 `.env`、`auths/`、`log/`；如果你在 `src/` 目录运行，则对应路径会变成 `src/.env`、`src/auths/`、`src/log/`。
 
