@@ -9,7 +9,11 @@
 // 规范要求：如果模型响应里出现 thoughtSignature，下一轮发送历史记录时必须原样带回到对应的 part。
 // 但 Claude Code 下一次请求不会回传 `tool_use.signature`（非标准字段），
 // 所以需要代理进程内维护一份 tool_use.id -> thoughtSignature 的映射，并在转回 v1internal 时补回。
-const toolThoughtSignatures = new Map(); // tool_use.id -> thoughtSignature
+// 注意：该缓存会随请求增长，需定期清理避免长期运行导致内存占用不断上涨。
+const TOOL_THOUGHT_SIGNATURE_TTL_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+const TOOL_THOUGHT_SIGNATURE_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const toolThoughtSignatures = new Map(); // tool_use.id -> { sig: string, expiresAt: number }
+let lastToolThoughtSignatureCleanupAt = 0;
 const crypto = require("crypto");
 const { maybeInjectMcpHintIntoSystemText } = require("../../mcp/claudeTransformerMcp");
 const fs = require("fs");
@@ -52,18 +56,53 @@ function isDebugEnabled() {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+function cleanupToolThoughtSignatures(now = Date.now()) {
+  if (now - lastToolThoughtSignatureCleanupAt < TOOL_THOUGHT_SIGNATURE_CLEANUP_INTERVAL_MS) return;
+  lastToolThoughtSignatureCleanupAt = now;
+
+  for (const [id, entry] of toolThoughtSignatures.entries()) {
+    if (!entry || typeof entry !== "object") {
+      toolThoughtSignatures.delete(id);
+      continue;
+    }
+    const expiresAt = entry.expiresAt;
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+      toolThoughtSignatures.delete(id);
+    }
+  }
+}
+
 function rememberToolThoughtSignature(toolUseId, thoughtSignature) {
   if (!toolUseId || !thoughtSignature) return;
+  cleanupToolThoughtSignatures();
   const id = String(toolUseId);
   const sig = String(thoughtSignature);
-  toolThoughtSignatures.set(id, sig);
+  toolThoughtSignatures.set(id, { sig, expiresAt: Date.now() + TOOL_THOUGHT_SIGNATURE_TTL_MS });
   if (isDebugEnabled()) console.log(`[ThoughtSignature] cached tool_use.id=${id} len=${sig.length}`);
 }
 
 function getToolThoughtSignature(toolUseId) {
   if (!toolUseId) return null;
+  cleanupToolThoughtSignatures();
   const id = String(toolUseId);
-  return toolThoughtSignatures.get(id) || null;
+  const entry = toolThoughtSignatures.get(id);
+  if (!entry) return null;
+
+  // Backward compatible in case legacy code stored string values.
+  if (typeof entry === "string") return entry;
+
+  if (typeof entry !== "object") {
+    toolThoughtSignatures.delete(id);
+    return null;
+  }
+
+  const expiresAt = entry.expiresAt;
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    toolThoughtSignatures.delete(id);
+    return null;
+  }
+
+  return typeof entry.sig === "string" ? entry.sig : null;
 }
 
 // ==================== 签名管理器 ====================
