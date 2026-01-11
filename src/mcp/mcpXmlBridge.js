@@ -146,13 +146,15 @@ function tryParseMcpToolCallXml(xmlText, toolName) {
   const text = String(xmlText || "").trim();
   if (!name || !text) return null;
 
-  const openRe = new RegExp(`^<${name}(?:\\\\s[^>]*)?>`, "i");
-  const closeRe = new RegExp(`</${name}>$`, "i");
+  const openRe = new RegExp(`^<${name}(?:\\s[^>]*)?>`, "i");
+  const closeRe = new RegExp(`</${name}\\s*>$`, "i");
   if (!openRe.test(text) || !closeRe.test(text)) return null;
 
   const openMatch = text.match(openRe);
   if (!openMatch) return null;
-  const inner = text.slice(openMatch[0].length, text.length - (`</${name}>`).length).trim();
+  const closeStart = text.toLowerCase().lastIndexOf(`</${name.toLowerCase()}`);
+  if (closeStart === -1 || closeStart < openMatch[0].length) return null;
+  const inner = text.slice(openMatch[0].length, closeStart).trim();
   if (!inner) return { name, input: {} };
 
   if (inner.startsWith("{") || inner.startsWith("[")) {
@@ -203,11 +205,28 @@ function createMcpXmlStreamParser(toolNames) {
     let best = -1;
     let bestName = null;
     for (const name of nameSet) {
-      const idx = text.indexOf(`<${name}`);
-      if (idx === -1) continue;
-      if (best === -1 || idx < best) {
-        best = idx;
-        bestName = name;
+      const open = `<${name}`;
+      let searchFrom = 0;
+      while (true) {
+        const idx = text.indexOf(open, searchFrom);
+        if (idx === -1) break;
+
+        // Ensure we only match full tag names, not prefixes (e.g. `<...__fill_form>` should not match `...__fill`).
+        const boundaryCh = text[idx + open.length];
+        const isBoundary = boundaryCh === ">" || boundaryCh === "/" || /\s/.test(boundaryCh || "");
+        if (!boundaryCh || !isBoundary) {
+          searchFrom = idx + 1;
+          continue;
+        }
+
+        if (best === -1 || idx < best) {
+          best = idx;
+          bestName = name;
+        } else if (idx === best && bestName && name.length > bestName.length) {
+          // Extra guard: overlapping tool names at the same index.
+          bestName = name;
+        }
+        break;
       }
     }
     return { index: best, name: bestName };
@@ -217,6 +236,33 @@ function createMcpXmlStreamParser(toolNames) {
     const out = [];
     if (!text) return out;
     buffer += String(text);
+
+    function findCloseTagEndIndex(src, toolName) {
+      const name = String(toolName || "");
+      const needle = `</${name}`;
+      let from = 0;
+      while (true) {
+        const idx = src.indexOf(needle, from);
+        if (idx === -1) return -1;
+        const after = idx + needle.length;
+        const ch = src[after];
+        // The close tag is incomplete in the buffer.
+        if (ch === undefined) return -1;
+        // Must be a boundary char (">" or whitespace). Reject things like `</nameX>`.
+        if (!(ch === ">" || /\s/.test(ch))) {
+          from = idx + 1;
+          continue;
+        }
+        const gt = src.indexOf(">", after);
+        if (gt === -1) return -1;
+        // Only allow whitespace between name and ">".
+        if (!/^\s*$/.test(src.slice(after, gt))) {
+          from = idx + 1;
+          continue;
+        }
+        return gt + 1;
+      }
+    }
 
     while (true) {
       const { index, name } = findNextToolStartIndex(buffer);
@@ -232,12 +278,11 @@ function createMcpXmlStreamParser(toolNames) {
         buffer = buffer.slice(index);
       }
 
-      const closeTag = `</${name}>`;
-      const closeIdx = buffer.indexOf(closeTag);
-      if (closeIdx === -1) break;
+      const closeEnd = findCloseTagEndIndex(buffer, name);
+      if (closeEnd === -1) break;
 
-      const xml = buffer.slice(0, closeIdx + closeTag.length);
-      buffer = buffer.slice(closeIdx + closeTag.length);
+      const xml = buffer.slice(0, closeEnd);
+      buffer = buffer.slice(closeEnd);
 
       const parsed = tryParseMcpToolCallXml(xml, name);
       if (parsed) out.push({ type: "tool", name: parsed.name, input: parsed.input });
