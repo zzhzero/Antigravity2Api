@@ -262,6 +262,28 @@ docker compose up -d --build
 *   **API 密钥 (API Key)**: 填写你在 `AG2API_API_KEYS` 中配置的任意一个 Key。
     *   支持的传递方式：`Authorization: Bearer <key>` / `x-api-key` / `anthropic-api-key` / `x-goog-api-key`
 
+opencode配置：
+
+1. .env中配置
+
+    AG2API_CLAUDE_MODEL_MAP={"claude-haiku-4-5":"gemini-3-flash","claude-haiku-4-5-20251001":"gemini-3-flash"}
+
+2. opencode中connect选择Anthropic，手动输入API KEY
+
+3. C:\Users\你的用户名\.config\opencode\opencode.json
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "http://localhost:3000/v1"
+      }
+    }
+  }
+}
+```
+
 ## 8. 常见问题
 
 *   **401 Unauthorized**: 检查客户端填写的 API Key 是否与 `AG2API_API_KEYS` 中的一致。
