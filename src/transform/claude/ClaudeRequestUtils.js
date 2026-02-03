@@ -30,9 +30,21 @@ function uppercaseSchemaTypes(schema) {
 /**
  * 清理 JSON Schema 以符合 Gemini 格式
  */
-function cleanJsonSchema(schema) {
+// Helper to infer type from value
+function inferType(val) {
+  if (val === null) return "null";
+  if (Array.isArray(val)) return "array";
+  return typeof val;
+}
+
+// Helper to assume if schema is just wrapping enums
+function isSimpleEnum(s) {
+  return s && typeof s === "object" && Array.isArray(s.enum) && Object.keys(s).every(k => k === "enum" || k === "type");
+}
+
+function cleanJsonSchema(schema, options = {}) {
   if (!schema || typeof schema !== "object") return schema;
-  if (Array.isArray(schema)) return schema.map(cleanJsonSchema);
+  if (Array.isArray(schema)) return schema.map((s) => cleanJsonSchema(s, options));
 
   const validationFields = {
     minLength: "minLength",
@@ -49,13 +61,14 @@ function cleanJsonSchema(schema) {
     "additionalProperties",
     "default",
     "uniqueItems",
-    // v1internal Schema doesn't support JSON Schema draft keywords like `propertyNames`.
     "propertyNames",
     "patternProperties",
     "unevaluatedProperties",
   ]);
-  let constValue;
+  // Combinators to check
+  const combinators = ["anyOf", "oneOf", "allOf"];
 
+  let constValue;
   const validations = [];
   for (const [field, label] of Object.entries(validationFields)) {
     if (field in schema) {
@@ -65,7 +78,27 @@ function cleanJsonSchema(schema) {
 
   const cleaned = {};
   for (const [key, value] of Object.entries(schema)) {
-    // Gemini Schema doesn't support JSON Schema "const"; map to enum([value]).
+    // Recursively clean combinators
+    if (combinators.includes(key)) {
+      if (Array.isArray(value)) {
+        const cleanedList = value.map((s) => cleanJsonSchema(s, options));
+        // Optimization: Flatten anyOf/oneOf if all options are enums of the same type
+        if ((key === "anyOf" || key === "oneOf") && cleanedList.length > 0 && cleanedList.every(isSimpleEnum)) {
+          const types = new Set(cleanedList.map(s => s.type).filter(Boolean));
+          if (types.size <= 1) {
+            const mergedEnum = cleanedList.flatMap(s => s.enum);
+            cleaned.enum = Array.from(new Set(mergedEnum));
+            if (types.size === 1) cleaned.type = types.values().next().value;
+            continue;
+          }
+        }
+        cleaned[key] = cleanedList;
+      } else {
+        cleaned[key] = value;
+      }
+      continue;
+    }
+
     if (key === "const") {
       constValue = value;
       continue;
@@ -73,43 +106,58 @@ function cleanJsonSchema(schema) {
 
     if (removeKeys.has(key) || key in validationFields) continue;
 
-    // `properties` is a map of propertyName -> schema. Preserve property names (e.g. a parameter named "format")
-    // and only clean each property's schema value.
     if (key === "properties" && value && typeof value === "object" && !Array.isArray(value)) {
       const cleanedProperties = {};
       for (const [propName, propSchema] of Object.entries(value)) {
         cleanedProperties[propName] =
-          typeof propSchema === "object" && propSchema !== null ? cleanJsonSchema(propSchema) : propSchema;
+          typeof propSchema === "object" && propSchema !== null
+            ? cleanJsonSchema(propSchema, options)
+            : propSchema;
       }
       cleaned.properties = cleanedProperties;
       continue;
     }
 
-    // Normalize union types like ["string","null"] to a single type (prefer non-null)
+    // Normalize union types like ["string","null"]
     if (key === "type" && Array.isArray(value)) {
       const filtered = value.filter((v) => v !== "null");
       cleaned.type = filtered[0] || value[0] || "string";
+      if (value.includes("null")) {
+        cleaned.nullable = true;
+      }
       continue;
     }
 
     if (key === "description" && validations.length > 0) {
       cleaned[key] = `${value} (${validations.join(", ")})`;
     } else if (typeof value === "object" && value !== null) {
-      cleaned[key] = cleanJsonSchema(value);
+      cleaned[key] = cleanJsonSchema(value, options);
     } else {
       cleaned[key] = value;
     }
   }
 
   if (constValue !== undefined) {
-    cleaned.enum = [constValue];
+    if (!cleaned.enum) cleaned.enum = [];
+    cleaned.enum.push(constValue);
+    // Infer type if missing
+    if (!cleaned.type) {
+      cleaned.type = inferType(constValue);
+    }
+  }
+
+  if (cleaned.enum && cleaned.enum.length > 1) {
+    cleaned.enum = Array.from(new Set(cleaned.enum));
   }
 
   if (validations.length > 0 && !cleaned.description) {
     cleaned.description = `Validation: ${validations.join(", ")}`;
   }
 
-  return uppercaseSchemaTypes(cleaned);
+  if (options.uppercaseTypes !== false) {
+    return uppercaseSchemaTypes(cleaned);
+  }
+  return cleaned;
 }
 
 function estimateBase64BytesLength(b64) {

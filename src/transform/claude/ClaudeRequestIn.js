@@ -31,7 +31,7 @@ let antigravitySystemInstructionText = "";
 try {
   antigravitySystemInstructionText = fs.readFileSync(path.resolve(__dirname, "antigravity_system_instruction.txt"), "utf8");
   antigravitySystemInstructionText = normalizeAntigravitySystemInstructionText(antigravitySystemInstructionText);
-} catch (_) {}
+} catch (_) { }
 
 /**
  * Claude 模型名映射到 Gemini 模型名
@@ -493,10 +493,14 @@ function transformClaudeRequestIn(claudeReq, projectId, options = {}) {
         //   continue;
         // }
         if (tool.input_schema) {
+          const cleanedParam = cleanJsonSchema(tool.input_schema, { uppercaseTypes: !isClaudeModel });
+          if ((isClaudeModel && tools[0].functionDeclarations.length === 18) || tool.name.includes("18")) {
+            console.log(`[DEBUG_SCHEMA] Tool 18 (${tool.name}) Cleaned Schema:`, JSON.stringify(cleanedParam, null, 2));
+          }
           const toolDecl = {
             name: tool.name,
             description: tool.description,
-            parameters: cleanJsonSchema(tool.input_schema),
+            parameters: cleanedParam,
           };
           tools[0].functionDeclarations.push(toolDecl);
         }
